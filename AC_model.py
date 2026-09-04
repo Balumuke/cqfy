@@ -1,9 +1,14 @@
 import os
-
 import joblib
 import numpy as np
 import pandas as pd
+import shap
+import statsmodels.api as sm
 from lightgbm import LGBMClassifier
+from patsy import build_design_matrices, dmatrix
+from scipy.special import logit
+from scipy.stats import chi2
+from statsmodels.stats.proportion import proportion_confint
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
@@ -11,6 +16,7 @@ from sklearn.feature_selection import chi2, f_classif
 from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.metrics import (
     accuracy_score,
+    brier_score_loss,
     confusion_matrix,
     f1_score,
     precision_score,
@@ -24,8 +30,8 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.svm import SVC
 from xgboost import XGBClassifier
 #%%
-DATA_FILE = "extracted_data.xlsx"
-TEMPORAL_DATA_FILE = None
+DATA_FILE = "Dec2023_Dec2026_data.xlsx"
+TEMPORAL_DATA_FILE = "Jan2026_Jun2026_data.xlsx"
 
 PREFERRED_SHEET = "Eng_revise"
 TEMPORAL_SHEET = "Eng_revise"
@@ -36,9 +42,47 @@ TEST_SIZE = 0.20
 N_SPLITS = 5
 RANDOM_STATE = 577
 FEATURE_METHOD = 0
-TOP_N = 20
+TOP_N = 10
 CORR_THRESHOLD = 0.80
 CLASSIFICATION_THRESHOLD = 0.50
+
+BOOTSTRAP_RESAMPLES = 2000
+BOOTSTRAP_CI = 0.95
+CALIBRATION_BINS = 10
+DCA_THRESHOLDS = np.arange(0.05, 0.51, 0.01)
+SHAP_SAMPLE_SIZE = 1000
+RCS_DF = 4
+RCS_GRID_POINTS = 200
+
+RCS_KEY_CONTINUOUS = [
+    "gestational days",
+    "neutrophil percentage",
+    "maximum amniotic fluid depth",
+    "BMI",
+    "daily temperature",
+]
+
+RCS_BASE_COVARIATES = [
+    "maternal age",
+    "maternal occupation",
+    "maternal educational level",
+    "maternal ethnicity",
+    "paternal age",
+    "paternal occupation",
+    "paternal educational level",
+    "paternal ethnicity",
+    "gravidity (G)",
+    "parity (P)",
+    "history of spontaneous abortion",
+    "history of induced abortion",
+    "history of cesarean section",
+    "history of vaginal delivery",
+    "systolic blood pressure",
+    "diastolic blood pressure",
+    "white blood cell count (WBC)",
+    "placental location",
+    "indication for amniocentesis",
+]
 
 
 feature_columns = [
@@ -477,6 +521,573 @@ def evaluate_model(model_bundle, X_test, y_test, cohort_name):
     return metrics, predictions
 
 #%%
+
+def bootstrap_confidence_intervals(
+    y_true,
+    y_probability,
+    n_resamples=BOOTSTRAP_RESAMPLES,
+    confidence_level=BOOTSTRAP_CI,
+    random_state=RANDOM_STATE,
+):
+    y_true = np.asarray(y_true).astype(int)
+    y_probability = np.asarray(y_probability, dtype=float)
+    rng = np.random.default_rng(random_state)
+
+    metric_names = [
+        "auc",
+        "accuracy",
+        "f1",
+        "precision",
+        "sensitivity",
+        "specificity",
+    ]
+    bootstrap_values = {name: [] for name in metric_names}
+
+    for _ in range(n_resamples):
+        indices = rng.integers(0, len(y_true), size=len(y_true))
+        y_boot = y_true[indices]
+        p_boot = y_probability[indices]
+
+        if np.unique(y_boot).size < 2:
+            continue
+
+        metrics = calculate_metrics(y_boot, p_boot)
+        for name in metric_names:
+            bootstrap_values[name].append(metrics[name])
+
+    alpha = (1.0 - confidence_level) / 2.0
+    point_estimates = calculate_metrics(y_true, y_probability)
+
+    rows = []
+    for name in metric_names:
+        values = np.asarray(bootstrap_values[name], dtype=float)
+        rows.append(
+            {
+                "metric": name,
+                "estimate": point_estimates[name],
+                "ci_lower": np.quantile(values, alpha),
+                "ci_upper": np.quantile(values, 1.0 - alpha),
+                "n_bootstrap_valid": len(values),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def calibration_analysis(
+    y_true,
+    y_probability,
+    n_bins=CALIBRATION_BINS,
+):
+    y_true = np.asarray(y_true).astype(int)
+    y_probability = np.asarray(y_probability, dtype=float)
+    clipped_probability = np.clip(y_probability, 1e-6, 1.0 - 1e-6)
+
+    brier = brier_score_loss(y_true, y_probability)
+
+    calibration_predictor = logit(clipped_probability)
+    calibration_design = sm.add_constant(calibration_predictor, has_constant="add")
+    calibration_model = sm.GLM(
+        y_true,
+        calibration_design,
+        family=sm.families.Binomial(),
+    ).fit()
+
+    calibration_intercept = float(calibration_model.params[0])
+    calibration_slope = float(calibration_model.params[1])
+
+    calibration_data = pd.DataFrame(
+        {
+            "observed": y_true,
+            "predicted_probability": y_probability,
+        }
+    )
+
+    n_unique = calibration_data["predicted_probability"].nunique()
+    q = min(n_bins, n_unique)
+
+    if q < 2:
+        calibration_data["bin"] = 0
+    else:
+        calibration_data["bin"] = pd.qcut(
+            calibration_data["predicted_probability"],
+            q=q,
+            labels=False,
+            duplicates="drop",
+        )
+
+    grouped_rows = []
+    for bin_id, group in calibration_data.groupby("bin", observed=True):
+        n = len(group)
+        events = int(group["observed"].sum())
+        observed_rate = events / n
+        ci_low, ci_high = proportion_confint(
+            count=events,
+            nobs=n,
+            alpha=0.05,
+            method="wilson",
+        )
+
+        grouped_rows.append(
+            {
+                "bin": int(bin_id),
+                "n": n,
+                "events": events,
+                "mean_predicted_probability": group["predicted_probability"].mean(),
+                "observed_event_proportion": observed_rate,
+                "observed_ci_lower": ci_low,
+                "observed_ci_upper": ci_high,
+            }
+        )
+
+    calibration_groups = pd.DataFrame(grouped_rows)
+
+    calibration_metrics = {
+        "brier_score": float(brier),
+        "calibration_intercept": calibration_intercept,
+        "calibration_slope": calibration_slope,
+    }
+
+    return calibration_metrics, calibration_groups
+
+
+def decision_curve_analysis(
+    y_true,
+    y_probability,
+    thresholds=DCA_THRESHOLDS,
+):
+    y_true = np.asarray(y_true).astype(int)
+    y_probability = np.asarray(y_probability, dtype=float)
+
+    n = len(y_true)
+    prevalence = y_true.mean()
+    rows = []
+
+    for threshold in thresholds:
+        predicted_high_risk = y_probability >= threshold
+
+        tp = np.sum((predicted_high_risk == 1) & (y_true == 1))
+        fp = np.sum((predicted_high_risk == 1) & (y_true == 0))
+        odds_at_threshold = threshold / (1.0 - threshold)
+
+        model_net_benefit = (
+            tp / n
+            - fp / n * odds_at_threshold
+        )
+        treat_all_net_benefit = (
+            prevalence
+            - (1.0 - prevalence) * odds_at_threshold
+        )
+
+        rows.append(
+            {
+                "threshold_probability": float(threshold),
+                "model_net_benefit": float(model_net_benefit),
+                "treat_all_net_benefit": float(treat_all_net_benefit),
+                "treat_none_net_benefit": 0.0,
+                "true_positive": int(tp),
+                "false_positive": int(fp),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _processed_feature_names(preprocessor):
+    categorical_names = list(
+        preprocessor.named_transformers_["cat"].get_feature_names_out(categorical_columns)
+    )
+    return continuous_columns + categorical_names
+
+
+def _processed_to_original_feature(processed_name):
+    if processed_name in continuous_columns:
+        return processed_name
+
+    for original_name in sorted(categorical_columns, key=len, reverse=True):
+        if processed_name == original_name or processed_name.startswith(f"{original_name}_"):
+            return original_name
+
+    return processed_name
+
+
+def run_shap_analysis(
+    model_bundle,
+    X_analysis,
+    y_analysis,
+    output_dir,
+):
+    if model_bundle["model_name"] not in {"LightGBM", "XGBoost"}:
+        raise ValueError(
+            "The current SHAP implementation is intended for the tree-based final model "
+            "used in the manuscript (LightGBM or XGBoost)."
+        )
+
+    n_sample = min(SHAP_SAMPLE_SIZE, len(X_analysis))
+
+    if n_sample < len(X_analysis):
+        sample_indices, _ = train_test_split(
+            np.arange(len(X_analysis)),
+            train_size=n_sample,
+            stratify=np.asarray(y_analysis),
+            random_state=RANDOM_STATE,
+        )
+        X_sample = X_analysis.iloc[sample_indices].copy()
+        y_sample = y_analysis.iloc[sample_indices].copy()
+    else:
+        X_sample = X_analysis.copy()
+        y_sample = y_analysis.copy()
+
+    preprocessor = model_bundle["preprocessor"]
+    X_sample_array = preprocessor.transform(X_sample)
+    processed_names = _processed_feature_names(preprocessor)
+
+    X_sample_processed = pd.DataFrame(
+        X_sample_array,
+        columns=processed_names,
+        index=X_sample.index,
+    )
+    X_model = X_sample_processed[model_bundle["selected_features"]]
+
+    explainer = shap.TreeExplainer(model_bundle["model"])
+    shap_result = explainer.shap_values(X_model)
+
+    if isinstance(shap_result, list):
+        shap_values = np.asarray(shap_result[-1])
+    elif hasattr(shap_result, "values"):
+        shap_values = np.asarray(shap_result.values)
+    else:
+        shap_values = np.asarray(shap_result)
+
+    if shap_values.ndim == 3:
+        shap_values = shap_values[:, :, -1]
+
+    if shap_values.shape != X_model.shape:
+        raise ValueError(
+            f"Unexpected SHAP shape {shap_values.shape}; expected {X_model.shape}."
+        )
+
+    processed_importance = pd.DataFrame(
+        {
+            "processed_feature": X_model.columns,
+            "mean_abs_shap": np.mean(np.abs(shap_values), axis=0),
+        }
+    ).sort_values("mean_abs_shap", ascending=False)
+
+    processed_importance["original_feature"] = processed_importance[
+        "processed_feature"
+    ].map(_processed_to_original_feature)
+
+    original_importance = (
+        processed_importance.groupby("original_feature", as_index=False)["mean_abs_shap"]
+        .sum()
+        .sort_values("mean_abs_shap", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    shap_values_frame = pd.DataFrame(
+        shap_values,
+        columns=[f"SHAP::{name}" for name in X_model.columns],
+        index=X_sample.index,
+    )
+
+    dependence_data = pd.DataFrame(
+        {
+            "observed": np.asarray(y_sample),
+            "predicted_probability": predict_probability(model_bundle["model"], X_model),
+        },
+        index=X_sample.index,
+    )
+
+    for feature in RCS_KEY_CONTINUOUS:
+        dependence_data[feature] = X_sample[feature]
+        if feature in X_model.columns:
+            dependence_data[f"SHAP::{feature}"] = shap_values_frame[f"SHAP::{feature}"]
+
+    processed_importance.to_csv(
+        os.path.join(output_dir, "shap_feature_importance_processed.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    original_importance.to_csv(
+        os.path.join(output_dir, "shap_feature_importance_original.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    dependence_data.to_csv(
+        os.path.join(output_dir, "shap_dependence_data.csv"),
+        index=True,
+        encoding="utf-8-sig",
+    )
+
+    return processed_importance, original_importance, dependence_data
+
+
+def _prepare_rcs_covariates(X, columns):
+    covariate_data = X[columns].copy()
+
+    categorical_covariates = [
+        column for column in columns if column in categorical_columns
+    ]
+    continuous_covariates = [
+        column for column in columns if column not in categorical_covariates
+    ]
+
+    parts = []
+
+    if continuous_covariates:
+        continuous_data = covariate_data[continuous_covariates].apply(
+            pd.to_numeric,
+            errors="raise",
+        )
+        parts.append(continuous_data.astype(float))
+
+    if categorical_covariates:
+        categorical_data = pd.get_dummies(
+            covariate_data[categorical_covariates].astype(str),
+            drop_first=True,
+            dtype=float,
+        )
+        parts.append(categorical_data)
+
+    if parts:
+        covariate_matrix = pd.concat(parts, axis=1)
+    else:
+        covariate_matrix = pd.DataFrame(index=X.index)
+
+    return covariate_matrix.astype(float)
+
+
+def run_rcs_analysis(
+    X_analysis,
+    y_analysis,
+    output_dir,
+):
+    X_analysis = X_analysis.reset_index(drop=True).copy()
+    y_analysis = pd.Series(np.asarray(y_analysis).astype(int)).reset_index(drop=True)
+
+    summary_rows = []
+
+    for focal_feature in RCS_KEY_CONTINUOUS:
+        adjustment_columns = list(RCS_BASE_COVARIATES)
+        adjustment_columns.extend(
+            [
+                feature
+                for feature in RCS_KEY_CONTINUOUS
+                if feature != focal_feature
+            ]
+        )
+
+        adjustment_columns = list(dict.fromkeys(adjustment_columns))
+        covariate_matrix = _prepare_rcs_covariates(
+            X_analysis,
+            adjustment_columns,
+        ).reset_index(drop=True)
+
+        focal_values = pd.to_numeric(
+            X_analysis[focal_feature],
+            errors="raise",
+        ).astype(float)
+
+        spline_basis = dmatrix(
+            f"cr(x, df={RCS_DF}) - 1",
+            {"x": focal_values},
+            return_type="dataframe",
+        )
+        spline_design_info = spline_basis.design_info
+        spline_basis = spline_basis.reset_index(drop=True)
+        spline_columns = [
+            f"spline_{index}"
+            for index in range(spline_basis.shape[1])
+        ]
+        spline_basis.columns = spline_columns
+
+        full_design = pd.concat(
+            [spline_basis, covariate_matrix],
+            axis=1,
+        )
+        full_design = sm.add_constant(full_design, has_constant="add").astype(float)
+
+        spline_model = sm.GLM(
+            y_analysis,
+            full_design,
+            family=sm.families.Binomial(),
+        ).fit()
+
+        linear_feature = pd.DataFrame(
+            {"x_linear": focal_values}
+        )
+        linear_design = pd.concat(
+            [linear_feature, covariate_matrix],
+            axis=1,
+        )
+        linear_design = sm.add_constant(
+            linear_design,
+            has_constant="add",
+        ).astype(float)
+
+        linear_model = sm.GLM(
+            y_analysis,
+            linear_design,
+            family=sm.families.Binomial(),
+        ).fit()
+
+        likelihood_ratio = max(
+            0.0,
+            2.0 * (spline_model.llf - linear_model.llf),
+        )
+        df_difference = max(1, len(spline_columns) - 1)
+        p_nonlinearity = float(
+            chi2.sf(likelihood_ratio, df_difference)
+        )
+
+        grid = np.linspace(
+            focal_values.min(),
+            focal_values.max(),
+            RCS_GRID_POINTS,
+        )
+
+        grid_basis = build_design_matrices(
+            [spline_design_info],
+            {"x": grid},
+        )[0]
+        grid_basis = np.asarray(grid_basis, dtype=float)
+
+        beta_spline = spline_model.params[spline_columns].to_numpy(dtype=float)
+        covariance_spline = spline_model.cov_params().loc[
+            spline_columns,
+            spline_columns,
+        ].to_numpy(dtype=float)
+
+        linear_predictor = grid_basis @ beta_spline
+        reference_index = int(np.argmin(linear_predictor))
+        reference_value = float(grid[reference_index])
+        reference_basis = grid_basis[reference_index]
+
+        contrast = grid_basis - reference_basis
+        log_or = contrast @ beta_spline
+
+        variance = np.einsum(
+            "ij,jk,ik->i",
+            contrast,
+            covariance_spline,
+            contrast,
+        )
+        standard_error = np.sqrt(np.clip(variance, 0.0, None))
+
+        odds_ratio = np.exp(log_or)
+        ci_lower = np.exp(log_or - 1.96 * standard_error)
+        ci_upper = np.exp(log_or + 1.96 * standard_error)
+
+        curve = pd.DataFrame(
+            {
+                "feature": focal_feature,
+                "value": grid,
+                "adjusted_or": odds_ratio,
+                "ci_lower": ci_lower,
+                "ci_upper": ci_upper,
+                "reference_value": reference_value,
+                "p_nonlinearity": p_nonlinearity,
+            }
+        )
+
+        safe_name = (
+            focal_feature.lower()
+            .replace(" ", "_")
+            .replace("/", "_")
+            .replace("(", "")
+            .replace(")", "")
+        )
+
+        curve.to_csv(
+            os.path.join(output_dir, f"rcs_curve_{safe_name}.csv"),
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        summary_rows.append(
+            {
+                "feature": focal_feature,
+                "reference_value": reference_value,
+                "p_nonlinearity": p_nonlinearity,
+                "likelihood_ratio": likelihood_ratio,
+                "df_difference": df_difference,
+            }
+        )
+
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv(
+        os.path.join(output_dir, "rcs_summary.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    return summary
+
+
+def save_evaluation_diagnostics(
+    cohort_name,
+    y_true,
+    predictions,
+    output_dir,
+    run_dca=False,
+):
+    y_probability = predictions["predicted_probability"].to_numpy()
+
+    bootstrap_ci = bootstrap_confidence_intervals(
+        y_true,
+        y_probability,
+        random_state=RANDOM_STATE,
+    )
+    bootstrap_ci.insert(0, "cohort", cohort_name)
+    bootstrap_ci.to_csv(
+        os.path.join(output_dir, f"{cohort_name}_bootstrap_ci.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    calibration_metrics, calibration_groups = calibration_analysis(
+        y_true,
+        y_probability,
+    )
+
+    calibration_metrics_frame = pd.DataFrame(
+        [
+            {
+                "cohort": cohort_name,
+                **calibration_metrics,
+            }
+        ]
+    )
+    calibration_metrics_frame.to_csv(
+        os.path.join(output_dir, f"{cohort_name}_calibration_metrics.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    calibration_groups.insert(0, "cohort", cohort_name)
+    calibration_groups.to_csv(
+        os.path.join(output_dir, f"{cohort_name}_calibration_groups.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    dca = None
+    if run_dca:
+        dca = decision_curve_analysis(
+            y_true,
+            y_probability,
+        )
+        dca.insert(0, "cohort", cohort_name)
+        dca.to_csv(
+            os.path.join(output_dir, f"{cohort_name}_decision_curve.csv"),
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+    return bootstrap_ci, calibration_metrics_frame, calibration_groups, dca
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -524,6 +1135,14 @@ def main():
         encoding="utf-8-sig",
     )
 
+    save_evaluation_diagnostics(
+        "internal_test",
+        y_test,
+        internal_predictions,
+        OUTPUT_DIR,
+        run_dca=False,
+    )
+
     if TEMPORAL_DATA_FILE:
         temporal_data = read_data(TEMPORAL_DATA_FILE, TEMPORAL_SHEET)
         X_temporal, y_temporal = prepare_data(temporal_data)
@@ -539,6 +1158,27 @@ def main():
             os.path.join(OUTPUT_DIR, "temporal_validation_predictions.csv"),
             encoding="utf-8-sig",
         )
+
+        save_evaluation_diagnostics(
+            "temporal_validation",
+            y_temporal,
+            temporal_predictions,
+            OUTPUT_DIR,
+            run_dca=True,
+        )
+
+    run_shap_analysis(
+        final_model,
+        X,
+        y,
+        OUTPUT_DIR,
+    )
+
+    run_rcs_analysis(
+        X,
+        y,
+        OUTPUT_DIR,
+    )
 
     evaluation_results = pd.DataFrame(evaluation_results)
 
